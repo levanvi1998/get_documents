@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>WebRTC + Overlay (WS metadata)</title>
+<style>
+  :root { background: #000; color: #fff; }
+  html,body{height:100%;margin:0;padding:0;font-family:Arial, sans-serif;background:#000;}
+  .container{
+    position:relative;
+    width:100%;
+    height:100%;
+    overflow:hidden;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    background:#000;
+  }
+
+  /* video element fills container, but object-fit:contain will letterbox inside it */
+  video#video {
+    width:100%;
+    height:100%;
+    object-fit:contain; /* important */
+    background:#111;
+    display:block;
+  }
+
+  /* canvas sits exactly over the video element (same bounding rect) */
+  canvas#overlay{
+    position:absolute;
+    top:0;
+    left:0;
+    pointer-events:none;
+    /* size/position updated from JS to match video bounding rect */
+  }
+
+  #message {
+    position:absolute;
+    z-index:30;
+    inset:12px 12px auto 12px;
+    background: rgba(0,0,0,0.45);
+    padding:6px 10px;
+    border-radius:6px;
+    font-size:13px;
+    pointer-events:none;
+  }
+</style>
+
+<!-- nếu bạn dùng reader.js (MediaMTX helper), giữ script; nếu không, bạn có thể gán srcObject thủ công -->
+<script defer src="./reader.js"></script>
+</head>
+<body>
+  <div class="container" id="playerWrap">
+    <video id="video" playsinline autoplay muted controls></video>
+    <canvas id="overlay"></canvas>
+    <div id="message">Đang kết nối...</div>
+  </div>
+
+<script>
+/*
+  Full HTML overlay:
+  - Kết nối WebRTC via reader.js (MediaMTX WHEP)
+  - Kết nối WebSocket tới ws://localhost:8765 để nhận metadata
+  - Tính toán đúng display area (preserve aspect) bên trong video element
+  - Vẽ bounding boxes chính xác (sử dụng x_px, y_px, w_px, h_px từ server)
+*/
+
+const video = document.getElementById('video');
+const overlay = document.getElementById('overlay');
+const ctx = overlay.getContext('2d');
+const message = document.getElementById('message');
+
+let lastBoxes = [];
+let frame_w = 1, frame_h = 1; // kích thước gốc frame do server gửi
+let ws = null;
+
+// Hiển thị thông báo
+function setMessage(txt){
+  message.innerText = txt || '';
+  message.style.display = txt ? 'block' : 'none';
+}
+
+// Khởi tạo WebSocket
+function startWS(){
+  try {
+    ws = new WebSocket('ws://localhost:8765');
+  } catch(err){
+    setMessage('Lỗi WS: ' + err.message);
+    return;
+  }
+
+  ws.onopen = () => setMessage('WS connected');
+  ws.onclose = () => setMessage('WS disconnected');
+  ws.onerror = (e) => setMessage('WS error');
+
+  ws.onmessage = (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+      lastBoxes = data.boxes || [];
+      frame_w = data.frame_w || frame_w;
+      frame_h = data.frame_h || frame_h;
+      // vẽ ngay
+      drawOverlay();
+    } catch(e){
+      console.warn('Invalid WS message', e);
+    }
+  };
+}
+
+// ========== Drawing logic ==========
+// Tính kích thước hiển thị thực của video content (giữa container) khi object-fit:contain
+function computeDisplayRect(){
+  // bounding rect của element video (phần element trên màn hình)
+  const rect = video.getBoundingClientRect();
+
+  // kích thước thực của video source
+  const vidW = video.videoWidth || frame_w || 1;
+  const vidH = video.videoHeight || frame_h || 1;
+
+  // scale để fit preserve-aspect (contain)
+  const scale = Math.min(rect.width / vidW, rect.height / vidH);
+
+  const dispW = vidW * scale;
+  const dispH = vidH * scale;
+
+  // offset (video content có thể được center bên trong element)
+  const offsetLeft = (rect.width - dispW) / 2;
+  const offsetTop  = (rect.height - dispH) / 2;
+
+  return {
+    containerRect: rect,
+    dispW, dispH,
+    offsetLeft, offsetTop,
+    scale
+  };
+}
+
+// Đồng bộ kích thước và vị trí canvas với video element container
+function syncCanvasToVideo(){
+  const rect = video.getBoundingClientRect();
+  // đặt canvas cùng kích thước với element video (cover element)
+  overlay.style.left = rect.left + 'px';
+  overlay.style.top  = rect.top  + 'px';
+  overlay.width  = rect.width;
+  overlay.height = rect.height;
+
+  // đặt canvas absolute tại root viewport (do overlay là absolute trong container, left/top 0),
+  // nhưng để tránh cross-origin offset issues khi container bị scrolled, ta set transform translate
+  // Thông thường overlay nằm trong cùng container, nên set left/top 0; ở đây dùng same stacking so OK.
+  // Nếu overlay không nằm ở cùng coordinate space, ta có thể set CSS transform; tuy nhiên overlay ở cùng container nên không cần.
+}
+
+// Vẽ lại tất cả bounding box
+function drawOverlay(){
+  if (!video || overlay.width === 0 || overlay.height === 0) return;
+
+  // compute display area inside the video element
+  const { dispW, dispH, offsetLeft, offsetTop, scale } = computeDisplayRect();
+
+  // clear whole canvas
+  ctx.clearRect(0,0,overlay.width, overlay.height);
+
+  // Translate origin to the top-left of the visible video content inside the element
+  // NOTE: overlay.width/height == element bounding rect width/height
+  // boxes coordinates b.x_px etc are in pixels relative to frame (frame_w x frame_h)
+  // We compute: screenX = offsetLeft + b.x_px * scale ; offsetLeft is inside element, so use it directly.
+  for (const b of lastBoxes){
+    // safe fallbacks
+    const bx = (b.x_px !== undefined) ? b.x_px : (b.x ? Math.round(b.x * frame_w) : 0);
+    const by = (b.y_px !== undefined) ? b.y_px : (b.y ? Math.round(b.y * frame_h) : 0);
+    const bw_px = (b.w_px !== undefined) ? b.w_px : (b.w ? Math.round(b.w * frame_w) : 0);
+    const bh_px = (b.h_px !== undefined) ? b.h_px : (b.h ? Math.round(b.h * frame_h) : 0);
+
+    const x = offsetLeft + bx * scale;
+    const y = offsetTop  + by * scale;
+    const w = bw_px * scale;
+    const h = bh_px * scale;
+
+    // styles
+    ctx.lineWidth = Math.max(2, Math.round(2 * scale));
+    ctx.strokeStyle = 'rgba(255, 80, 80, 0.95)';
+    ctx.fillStyle   = 'rgba(255,80,80,0.95)';
+
+    // draw box (rounded corners)
+    roundRect(ctx, x, y, w, h, 6);
+    ctx.stroke();
+
+    // label and score
+    if (b.label || b.score !== undefined){
+      const label = b.label ? b.label + (b.score ? ` ${(Math.round(b.score*100))}%` : '') : (b.score ? `${Math.round(b.score*100)}%` : '');
+      const padding = 6;
+      ctx.font = `${Math.max(12, Math.round(12 * scale))}px Arial`;
+      ctx.textBaseline = 'top';
+      const textWidth = ctx.measureText(label).width;
+      const tx = x;
+      const ty = Math.max(0, y - (Math.round(18 * scale)));
+
+      // background
+      ctx.fillStyle = 'rgba(255,80,80,0.9)';
+      ctx.fillRect(tx - 1, ty - 1, textWidth + padding, Math.round(18 * scale));
+
+      // text
+      ctx.fillStyle = 'white';
+      ctx.fillText(label, tx + (padding/2), ty + 1);
+    }
+  }
+}
+
+// helper: rounded rect path
+function roundRect(ctx, x, y, w, h, r){
+  if (w < 0) { x += w; w = -w; }
+  if (h < 0) { y += h; h = -h; }
+  const radius = Math.min(r, w/2, h/2);
+  ctx.beginPath();
+  ctx.moveTo(x + radius, y);
+  ctx.arcTo(x + w, y, x + w, y + h, radius);
+  ctx.arcTo(x + w, y + h, x, y + h, radius);
+  ctx.arcTo(x, y + h, x, y, radius);
+  ctx.arcTo(x, y, x + w, y, radius);
+  ctx.closePath();
+}
+
+// ========== Sync / observers ==========
+// Khi video element thay đổi kích thước (window resize / UI change)
+function refreshLayoutAndDraw(){
+  // update canvas size to match video element bounding rect
+  const rect = video.getBoundingClientRect();
+  // đặt overlay phủ toàn phần của container (overlay absolute inside same container)
+  overlay.style.left = '0px';
+  overlay.style.top  = '0px';
+  overlay.width = rect.width;
+  overlay.height = rect.height;
+
+  // Make sure the overlay element visually sits exactly over the video element:
+  // since both are positioned inside the same .container and overlay is absolute,
+  // overlay will align. If you move overlay outside container, you'd need to reposition by rect.left/top.
+
+  drawOverlay();
+}
+
+// Observe size changes of the container/video
+const ro = new ResizeObserver(() => refreshLayoutAndDraw());
+ro.observe(document.getElementById('playerWrap'));
+ro.observe(video);
+
+// Khi metadata video (videoWidth/videoHeight) có sẵn → redraw
+video.addEventListener('loadedmetadata', () => {
+  setMessage('Video ready');
+  refreshLayoutAndDraw();
+});
+
+// Khi video frame changes (ví dụ srcObject mới), vẽ lại overlay (keeps boxes in place)
+video.addEventListener('play', () => {
+  refreshLayoutAndDraw();
+});
+
+// redraw periodically (safety) so overlay stays in sync if something changes
+let redrawTicker = setInterval(() => {
+  if (!document.hidden) drawOverlay();
+}, 120);
+
+// ========== Start WHEP reader (MediaMTX) ==========
+window.addEventListener('load', () => {
+  // Nếu bạn đã có reader.js (MediaMTX WebRTC helper), dùng như trước
+  try {
+    const reader = new MediaMTXWebRTCReader({
+      url: new URL('whep', "http://localhost:8889/streams/video1/"),
+      onError: (err) => setMessage('WHEP error: ' + err),
+      onTrack: (evt) => {
+        setMessage('');
+        video.srcObject = evt.streams[0];
+      },
+    });
+    // lưu nếu cần đóng lúc unload
+    window.addEventListener('beforeunload', () => reader && reader.close());
+  } catch(e){
+    console.warn('No reader.js or error constructing reader:', e);
+    setMessage('Không tìm thấy reader.js hoặc lỗi khởi tạo WHEP');
+  }
+
+  // start websocket metadata
+  startWS();
+});
+
+// Clean up on unload
+window.addEventListener('beforeunload', () => {
+  try { if (ws) ws.close(); } catch(e){}
+  try { clearInterval(redrawTicker); } catch(e){}
+});
+
+</script>
+</body>
+</html>
